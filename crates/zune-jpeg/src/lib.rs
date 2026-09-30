@@ -171,6 +171,7 @@ pub use zune_core;
 
 pub use crate::components::SampleRatios;
 pub use crate::decoder::{ImageInfo, JpegDecoder};
+pub use crate::mcu_rows::{McuRowBand, McuRowReader, NotBandable};
 pub use crate::marker::Marker;
 mod bitstream;
 mod color_convert;
@@ -186,6 +187,7 @@ pub mod idct;
 mod marker;
 mod mcu;
 mod mcu_prog;
+mod mcu_rows;
 mod misc;
 mod unsafe_utils;
 mod unsafe_utils_avx2;

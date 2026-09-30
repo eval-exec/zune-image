@@ -29,6 +29,47 @@ use crate::JpegDecoder;
 
 pub const DCT_BLOCK: usize = 64;
 
+/// The state a baseline decode carries from one MCU row to the next.
+///
+/// Everything [`JpegDecoder::decode_mcu_ycbcr_baseline`] used to keep in locals,
+/// lifted into one value so that a single turn of that loop can be taken on its
+/// own ([`JpegDecoder::baseline_mcu_row`]): the whole-image path hands the same
+/// struct back turn after turn, and a row-wise reader
+/// ([`crate::mcu_rows::McuRowReader`]) keeps one per image. Both then run the
+/// same code over the same state, which is what makes them the same decoder
+/// rather than two that have to be kept in agreement.
+pub(crate) struct BaselineRun {
+    /// The bit stream the MCU rows are read from.
+    pub stream: BitStream,
+    /// Scratch for one MCU row's blocks.
+    pub tmp: [i32; DCT_BLOCK],
+    /// Whole-image block buffers for the case where components are split across
+    /// scans, where no MCU row can be colour converted until every scan has
+    /// landed. Empty in the ordinary case.
+    pub progressive_mcus: [Vec<i16>; 4],
+    /// Scratch the up-sampler reads and writes.
+    pub upsampler_scratch_space: Vec<i16>,
+    /// MCUs across, in the sense this loop uses the word.
+    pub mcu_width: usize,
+    /// MCU rows down, likewise.
+    pub mcu_height: usize,
+    /// Image width in pixels, unpadded — the width of one output row.
+    pub width: usize,
+    /// Width the per-component MCU buffers are strided by.
+    pub padded_width: usize,
+    /// Bytes of the caller's buffer written so far.
+    pub pixels_written: usize,
+    /// Whether every component is in the first scan, and so whether an MCU row
+    /// can be colour converted as soon as it has been read.
+    pub all_components_in_first_scan: bool,
+    /// Most output rows one turn of the loop can write.
+    ///
+    /// The loop writes into the caller's buffer without checking it, so a
+    /// caller that hands it one turn's worth of buffer has to know this
+    /// number; [`crate::mcu_rows::McuRowReader`] sizes its own from here.
+    pub row_capacity: usize
+}
+
 impl<T: ZByteReaderTrait> JpegDecoder<T> {
     /// Check for existence of DC and AC Huffman Tables
     pub(crate) fn check_tables(&self) -> Result<(), DecodeErrors> {
@@ -88,6 +129,91 @@ impl<T: ZByteReaderTrait> JpegDecoder<T> {
     pub(crate) fn decode_mcu_ycbcr_baseline(
         &mut self, pixels: &mut [u8]
     ) -> Result<(), DecodeErrors> {
+        let mut run = self.baseline_run_setup()?;
+
+        'sos: loop {
+            trace!(
+                "Baseline decoding of components: {:?}",
+                &self.z_order[..usize::from(self.num_scans)]
+            );
+
+            trace!("Decoding MCU width: {}, height: {}", run.mcu_width, run.mcu_height);
+
+            for i in 0..run.mcu_height {
+                let terminate = self.baseline_mcu_row(&mut run, i, pixels)?;
+
+                match terminate {
+                    McuContinuation::Ok => {}
+                    // The stream ran out; `baseline_mcu_row` filled the rest of
+                    // the buffer, so this breaks out exactly as inlined `break`
+                    // did.
+                    McuContinuation::PrematureEnd => break,
+                    McuContinuation::AnotherSos if run.all_components_in_first_scan => {
+                        warn!("More than one SOS despite already having all components");
+                        return Ok(());
+                    }
+                    McuContinuation::AnotherSos => continue 'sos,
+                    McuContinuation::InterScanMarker(marker) => {
+                        // Handle inter-scan markers (DHT/DQT/etc) uniformly here.
+                        // This keeps all marker handling in the outer loop.
+                        if self.advance_to_next_sos(marker, &mut run.stream)? {
+                            continue 'sos;
+                        } else {
+                            // Hit EOI
+                            break;
+                        }
+                    }
+                    McuContinuation::Terminate => {
+                        warn!("Got terminate signal, will not process further");
+                        pixels.get_mut(run.pixels_written..).map(|v| v.fill(128));
+                        return Ok(());
+                    }
+                }
+            }
+
+            // Breaks if we get here, looping only if we have restarted, i.e. found another SOS and
+            // continued at `'sos'.
+            break;
+        }
+
+        if !run.all_components_in_first_scan {
+            self.finish_baseline_decoding(&run.progressive_mcus, run.mcu_width, pixels)?;
+        }
+
+        // it may happen that some images don't have the whole buffer
+        // so we can't panic in case of that
+        // assert_eq!(pixels_written, pixels.len());
+
+        // For UHD usecases that tie two images separating them with EOI and
+        // SOI markers, it may happen that we do not reach this image end of image
+        // So this ensures we reach it
+        // Ensure we read EOI
+        if !run.stream.seen_eoi {
+            let marker = get_marker(&mut self.stream, &mut run.stream);
+            match marker {
+                Ok(_m) => {
+                    trace!("Found marker {:?}", _m);
+                }
+                Err(_) => {
+                    // ignore error
+                }
+            }
+        }
+
+        trace!("Finished decoding image");
+
+        Ok(())
+    }
+
+    /// Everything a baseline decode needs before it reads its first MCU row.
+    ///
+    /// Split out of the decode loop so that the loop's *turns* can be taken one
+    /// at a time by someone else ([`crate::mcu_rows::McuRowReader`]) without a
+    /// second copy of this: the component parameters, the MCU geometry, the
+    /// per-component buffers and the scratch one MCU row is read through are
+    /// the same state either way, and a second copy of this is exactly where
+    /// the two would drift apart into two different pictures.
+    pub(crate) fn baseline_run_setup(&mut self) -> Result<BaselineRun, DecodeErrors> {
         setup_component_params(self)?;
 
         // check dc and AC tables
@@ -138,8 +264,8 @@ impl<T: ZByteReaderTrait> JpegDecoder<T> {
 
         let padded_width = calculate_padded_width(width, self.info.sample_ratio);
 
-        let mut stream = BitStream::new();
-        let mut tmp = [0_i32; DCT_BLOCK];
+        let stream = BitStream::new();
+        let tmp = [0_i32; DCT_BLOCK];
 
         let comp_len = self.components.len();
 
@@ -184,139 +310,111 @@ impl<T: ZByteReaderTrait> JpegDecoder<T> {
             }
         }
 
-        let mut pixels_written = 0;
+        let pixels_written = 0;
 
         let is_hv = usize::from(self.is_interleaved);
         let upsampler_scratch_size = is_hv * self.components.iter().map(|x| x.width_stride).max().unwrap_or(0) * 8;
-        let mut upsampler_scratch_space = vec![0; upsampler_scratch_size];
+        let upsampler_scratch_space = vec![0; upsampler_scratch_size];
 
-        'sos: loop {
-            trace!(
-                "Baseline decoding of components: {:?}",
-                &self.z_order[..usize::from(self.num_scans)]
-            );
+        // An upper bound on the output rows one turn of the loop can write,
+        // computed from the state `post_process` will read: a vertically
+        // sampled image writes the tail of the previous MCU row (at most
+        // `coeff * v_max` rows) and then at most eight MCU rows of its own
+        // (`8 * coeff * v_max`). Every other shape writes at most
+        // `8 * coeff * v_max`. Nine times the product covers both. It is
+        // computed here because `reset_params` and the grayscale-correction
+        // above are what decide `coeff`, `v_max` and `is_interleaved`.
+        let row_capacity = 9 * self.coeff * self.v_max.max(1);
 
-            trace!("Decoding MCU width: {mcu_width}, height: {mcu_height}");
+        Ok(BaselineRun {
+            stream,
+            tmp,
+            progressive_mcus,
+            upsampler_scratch_space,
+            mcu_width,
+            mcu_height,
+            width,
+            padded_width,
+            pixels_written,
+            all_components_in_first_scan,
+            row_capacity
+        })
+    }
 
-            for i in 0..mcu_height {
-                if stream.overread_by > 0 {
-                    pixels.get_mut(pixels_written..).map(|v| v.fill(128));
-                    if self.options.strict_mode() {
-                        return Err(DecodeErrors::FormatStatic("Premature end of buffer"));
-                    };
+    /// One turn of the baseline decode loop: read one MCU row and colour convert
+    /// it.
+    ///
+    /// `i` is the MCU row's index, which `post_process` wants for the
+    /// vertically-sampled tail; `pixels` is written at
+    /// [`BaselineRun::pixels_written`], so a caller that resets that to zero
+    /// before every turn reads the image one MCU row per buffer instead of once
+    /// into the whole of it. The two are the same code: the whole-image loop
+    /// lets `pixels_written` run on, and a row-wise reader resets it.
+    pub(crate) fn baseline_mcu_row(
+        &mut self, run: &mut BaselineRun, i: usize, pixels: &mut [u8]
+    ) -> Result<McuContinuation, DecodeErrors> {
+        if run.stream.overread_by > 0 {
+            pixels.get_mut(run.pixels_written..).map(|v| v.fill(128));
+            if self.options.strict_mode() {
+                return Err(DecodeErrors::FormatStatic("Premature end of buffer"));
+            };
 
-                    error!("Premature end of buffer");
-                    break;
-                }
-
-                // decode a whole MCU width,
-                // this takes into account interleaved components.
-                let terminate = if all_components_in_first_scan {
-                    self.decode_mcu_width::<false>(
-                        mcu_width,
-                        i,
-                        &mut tmp,
-                        &mut stream,
-                        &mut progressive_mcus
-                    )?
-                } else {
-                    /* NB: (cae). This code was added due to the issue at https://github.com/etemesi254/zune-image/issues/277
-                    *
-                    * There is a particular set of images that interleave the start of scan (SOS) with the MCU,
-                    * E.g if it's a three component image, we have SOS->MCU ->SOS->MCU ->SOS->MCU
-                    * which presents a problem on decoding, we need to buffer the whole image before continuing since
-                    * we won't have a row containing all the component data which will be needed e.g for color conversion.
-                    *
-                    * The mechanisms is that we decode the whole image upfront, which goes against the normal
-                    * routine of decoding MCU width , so this requires more memory upfront than initial routines
-                    * but it is a single image out of the many corpuses that exist, so its fine.
-                    * (image in test-images/jpeg/sos_news.jpeg)
-
-                    * Code contributed by  Aurelia Molzer (https://github.com/197g)
-
-                    *
-                    */
-
-                    self.decode_mcu_width::<true>(
-                        mcu_width,
-                        i,
-                        &mut tmp,
-                        &mut stream,
-                        &mut progressive_mcus
-                    )?
-                };
-
-                // process that width up until it's impossible. This is faster than allocation the
-                // full components, which we skipped earlier.
-                if all_components_in_first_scan {
-                    self.post_process(
-                        pixels,
-                        i,
-                        mcu_height,
-                        width,
-                        padded_width,
-                        &mut pixels_written,
-                        &mut upsampler_scratch_space
-                    )?;
-                }
-
-                match terminate {
-                    McuContinuation::Ok => {}
-                    McuContinuation::AnotherSos if all_components_in_first_scan => {
-                        warn!("More than one SOS despite already having all components");
-                        return Ok(());
-                    }
-                    McuContinuation::AnotherSos => continue 'sos,
-                    McuContinuation::InterScanMarker(marker) => {
-                        // Handle inter-scan markers (DHT/DQT/etc) uniformly here.
-                        // This keeps all marker handling in the outer loop.
-                        if self.advance_to_next_sos(marker, &mut stream)? {
-                            continue 'sos;
-                        } else {
-                            // Hit EOI
-                            break;
-                        }
-                    }
-                    McuContinuation::Terminate => {
-                        warn!("Got terminate signal, will not process further");
-                        pixels.get_mut(pixels_written..).map(|v| v.fill(128));
-                        return Ok(());
-                    }
-                }
-            }
-
-            // Breaks if we get here, looping only if we have restarted, i.e. found another SOS and
-            // continued at `'sos'.
-            break;
+            error!("Premature end of buffer");
+            return Ok(McuContinuation::PrematureEnd);
         }
 
-        if !all_components_in_first_scan {
-            self.finish_baseline_decoding(&progressive_mcus, mcu_width, pixels)?;
+        // decode a whole MCU width,
+        // this takes into account interleaved components.
+        let terminate = if run.all_components_in_first_scan {
+            self.decode_mcu_width::<false>(
+                run.mcu_width,
+                i,
+                &mut run.tmp,
+                &mut run.stream,
+                &mut run.progressive_mcus
+            )?
+        } else {
+            /* NB: (cae). This code was added due to the issue at https://github.com/etemesi254/zune-image/issues/277
+            *
+            * There is a particular set of images that interleave the start of scan (SOS) with the MCU,
+            * E.g if it's a three component image, we have SOS->MCU ->SOS->MCU ->SOS->MCU
+            * which presents a problem on decoding, we need to buffer the whole image before continuing since
+            * we won't have a row containing all the component data which will be needed e.g for color conversion.
+            *
+            * The mechanisms is that we decode the whole image upfront, which goes against the normal
+            * routine of decoding MCU width , so this requires more memory upfront than initial routines
+            * but it is a single image out of the many corpuses that exist, so its fine.
+            * (image in test-images/jpeg/sos_news.jpeg)
+
+            * Code contributed by  Aurelia Molzer (https://github.com/197g)
+
+            *
+            */
+
+            self.decode_mcu_width::<true>(
+                run.mcu_width,
+                i,
+                &mut run.tmp,
+                &mut run.stream,
+                &mut run.progressive_mcus
+            )?
+        };
+
+        // process that width up until it's impossible. This is faster than allocation the
+        // full components, which we skipped earlier.
+        if run.all_components_in_first_scan {
+            self.post_process(
+                pixels,
+                i,
+                run.mcu_height,
+                run.width,
+                run.padded_width,
+                &mut run.pixels_written,
+                &mut run.upsampler_scratch_space
+            )?;
         }
 
-        // it may happen that some images don't have the whole buffer
-        // so we can't panic in case of that
-        // assert_eq!(pixels_written, pixels.len());
-
-        // For UHD usecases that tie two images separating them with EOI and
-        // SOI markers, it may happen that we do not reach this image end of image
-        // So this ensures we reach it
-        // Ensure we read EOI
-        if !stream.seen_eoi {
-            let marker = get_marker(&mut self.stream, &mut stream);
-            match marker {
-                Ok(_m) => {
-                    trace!("Found marker {:?}", _m);
-                }
-                Err(_) => {
-                    // ignore error
-                }
-            }
-        }
-
-        trace!("Finished decoding image");
-
-        Ok(())
+        Ok(terminate)
     }
 
     /// Process all MCUs when baseline decoding has been processing them component-after-component.
@@ -947,8 +1045,11 @@ impl<T: ZByteReaderTrait> JpegDecoder<T> {
     }
 }
 
-enum McuContinuation {
+pub(crate) enum McuContinuation {
     Ok,
+    /// The bit stream ran out before the image did. Whatever the caller had
+    /// left to decode has already been filled with 128.
+    PrematureEnd,
     AnotherSos,
     /// Found an inter-scan marker (DHT/DQT/DRI/COM/APP) that needs handling.
     /// The caller should parse it and scan for the next SOS.

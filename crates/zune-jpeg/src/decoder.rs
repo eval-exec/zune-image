@@ -28,6 +28,7 @@ use crate::headers::{
 use crate::huffman::HuffmanTable;
 use crate::idct::{choose_idct_func, choose_idct_1x1_func, choose_idct_4x4_func};
 use crate::marker::Marker;
+use crate::mcu_rows::NotBandable;
 use crate::misc::SOFMarkers;
 use crate::upsampler::{
     choose_horizontal_samp_function, choose_hv_samp_function, choose_v_samp_function,
@@ -948,6 +949,50 @@ where
         } else {
             None
         };
+    }
+
+    /// Whether the image is progressive.
+    ///
+    /// A progressive image is decoded in several scans, each carrying part of
+    /// every block, and a block is only its final value once the last scan has
+    /// landed. There is therefore no point during a progressive decode at which
+    /// a prefix of the image is already correct, and no caller may take the
+    /// pixels of one as final: [`crate::mcu_rows::McuRowReader`] refuses such an
+    /// image for that reason, and this is what a caller reads to route it to a
+    /// whole decode instead.
+    ///
+    /// `false` before the headers have been read, because nothing about the
+    /// image is known yet — use [`Self::mcu_rows_available`] when what is
+    /// wanted is whether a decode can be banded.
+    #[must_use]
+    pub const fn is_progressive(&self) -> bool {
+        self.is_progressive
+    }
+
+    /// Whether this decoder can hand back its image one MCU row at a time, and
+    /// if not, why not.
+    ///
+    /// Answered from the headers alone, without consuming the decoder, so a
+    /// caller can choose between [`crate::mcu_rows::McuRowReader::new`] and
+    /// [`Self::decode_into`] before doing either. The same question, asked by
+    /// the reader's own constructor.
+    ///
+    /// # Errors
+    /// - [`NotBandable::HeadersNotRead`] if the headers have not been decoded.
+    /// - [`NotBandable::Progressive`] if the image is progressive.
+    /// - [`NotBandable::SplitScan`] if the image's components are not all in
+    ///   the first scan.
+    pub fn mcu_rows_available(&self) -> Result<(), NotBandable> {
+        if !self.headers_decoded {
+            return Err(NotBandable::HeadersNotRead);
+        }
+        if self.is_progressive {
+            return Err(NotBandable::Progressive);
+        }
+        if usize::from(self.num_scans) != self.components.len() {
+            return Err(NotBandable::SplitScan);
+        }
+        Ok(())
     }
 }
 
